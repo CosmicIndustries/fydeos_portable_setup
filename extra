@@ -1,0 +1,451 @@
+Nice — I re-read the whole convo and I’ll skip repeating what we already did. Below are **new, concrete, higher-impact tasks** (with commands / scripts and verification steps) you haven’t done yet — each one moves your FydeOS live-USB from “works” to a resilient, low-wear, secure, reproducible portable system. Pick the ones you want and run them in sequence. I made them practical so you can copy/paste.
+
+---
+
+# 1 — Encrypted persistent partition (LUKS) for the USB persistence area
+
+Why: keeps your persistent data safe if the USB is lost; prevents tampering.
+
+**Script** (`encrypt_usb_persist.sh`)
+
+```bash
+#!/bin/bash
+set -e
+# WARNING: This will DESTROY data on the target partition.
+LABEL="FYDE_PERSIST"
+DEV="/dev/sdb2"          # change to your persistence partition (NOT the FydeOS boot partitions)
+MAPPER_NAME="fyde_persist"
+MOUNT_POINT="/mnt/usb_persist"
+
+# 1. Wipe header (optional, stronger)
+sudo dd if=/dev/zero of="$DEV" bs=1M count=4
+
+# 2. Format LUKS
+sudo cryptsetup luksFormat --type=luks2 "$DEV"
+# 3. Open it
+sudo cryptsetup open "$DEV" "$MAPPER_NAME"
+# 4. Create fs
+sudo mkfs.ext4 -L "$LABEL" /dev/mapper/"$MAPPER_NAME"
+# 5. Mount
+sudo mkdir -p "$MOUNT_POINT"
+sudo mount /dev/mapper/"$MAPPER_NAME" "$MOUNT_POINT"
+# 6. Make a directory structure
+sudo mkdir -p "$MOUNT_POINT"/{upper,work,tmpfiles}
+sudo chown chronos:chronos "$MOUNT_POINT"/upper
+
+echo "Done. To open later: sudo cryptsetup open $DEV $MAPPER_NAME && sudo mount /dev/mapper/$MAPPER_NAME $MOUNT_POINT"
+```
+
+**Verify**
+
+```bash
+lsblk -f        # check mapper present
+sudo cryptsetup status fyde_persist
+```
+
+**Notes**
+
+* You’ll type a passphrase on each boot/unlock. If you want keyfile automation, store keyfile in a secure place (not on same USB) or use TPM (complex).
+
+---
+
+# 2 — Use overlayfs for `/home` and `/var/lib` (read-only root, writes go to persistence)
+
+Why: reduces corruption and wear to system partition; keeps persistent data localized.
+
+**Service + mount script**
+
+Create `/usr/local/bin/mount_persist_overlay.sh`:
+
+```bash
+#!/bin/bash
+set -e
+PERSIST="/mnt/usb_persist"   # from previous task (must be mounted & unlocked)
+UP_HOME="$PERSIST/upper_home"
+WORK_HOME="$PERSIST/work_home"
+MERGE_HOME="/home"
+
+mkdir -p "$UP_HOME" "$WORK_HOME"
+mount -t overlay overlay -o lowerdir=/home,upperdir="$UP_HOME",workdir="$WORK_HOME" "$MERGE_HOME" || {
+  echo "Overlay mount failed"; exit 1
+}
+```
+
+Make executable:
+
+```bash
+sudo chmod +x /usr/local/bin/mount_persist_overlay.sh
+```
+
+Create systemd unit `/etc/systemd/system/mount-overlay.service`:
+
+```ini
+[Unit]
+Description=Mount overlayfs for home using USB persistence
+After=cryptsetup-open@fyde_persist.service
+Requires=cryptsetup-open@fyde_persist.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mount_persist_overlay.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable mount-overlay.service
+```
+
+**Verify**
+
+```bash
+mount | grep overlay
+ls "$PERSIST/upper_home"
+```
+
+**Caveats**
+
+* Don’t overlay `/` unless you know how to pivot_root — danger of bricking live system. Overlay `/home`, `/var/lib` only.
+
+---
+
+# 3 — Reduce write amplification: move volatile directories to tmpfs with periodic flushes
+
+Why: reduce USB wear by keeping heavy writes in RAM and only occasionally flushing to persistence.
+
+**fstab entries (append to /etc/fstab)**:
+
+```text
+tmpfs   /tmp           tmpfs   mode=1777,size=256M 0 0
+tmpfs   /var/log       tmpfs   mode=0755,size=128M  0 0
+tmpfs   /var/cache     tmpfs   mode=0755,size=128M  0 0
+```
+
+**Periodic flush script** `/usr/local/sbin/flush_tmpfs.sh`:
+
+```bash
+#!/bin/bash
+set -e
+PERSIST="/mnt/usb_persist"
+RSYNC_OPTS="-aH --delete --exclude=/var/log/journal --link-dest=$PERSIST/snapshots/current"
+SNAPROOT="$PERSIST/snapshots"
+mkdir -p "$SNAPROOT"
+# rotate
+TIMESTAMP=$(date +%Y%m%d-%H%M)
+DEST="$SNAPROOT/$TIMESTAMP"
+mkdir -p "$DEST"
+# example: persist logs and selected caches
+rsync $RSYNC_OPTS /var/log "$DEST/"
+rsync -a /home/chronos/.config "$DEST/"
+# update current symlink
+ln -nfs "$DEST" "$SNAPROOT/current"
+```
+
+Make executable and add cron `/etc/cron.daily/flush_tmpfs`:
+
+```bash
+sudo ln -s /usr/local/sbin/flush_tmpfs.sh /etc/cron.daily/flush_tmpfs
+```
+
+**Verify**
+
+```bash
+free -h
+df -h /mnt/usb_persist/snapshots
+```
+
+---
+
+# 4 — zram swap (reduces writes vs real swap)
+
+Why: avoid using swap on USB which would thrash it. zram keeps compressed swap in RAM.
+
+**One-line to enable now**
+
+```bash
+sudo modprobe zram num_devices=1
+echo lz4 | sudo tee /sys/block/zram0/comp_algorithm
+echo $(( $(free -m | awk '/Mem:/ {print $2}') / 2 )) | sudo tee /sys/block/zram0/disksize  # half RAM
+sudo mkswap /dev/zram0
+sudo swapon /dev/zram0
+```
+
+**systemd service** `/etc/systemd/system/zram.service`
+
+```ini
+[Unit]
+Description=Configure zram swap
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/setup_zram.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`/usr/local/bin/setup_zram.sh` holds the modprobe + mkswap commands above.
+
+**Verify**
+
+```bash
+swapon --show
+cat /proc/swaps
+```
+
+---
+
+# 5 — Atomic, space-efficient backups with `rsync --link-dest` (rotating snapshots)
+
+Why: maintain compact incremental backups of your scripts & dotfiles.
+
+**Backup script** `/usr/local/bin/rsync_snapshots.sh`
+
+```bash
+#!/bin/bash
+set -e
+SRC="/home/chronos"
+DEST="/mnt/usb_persist/backups"
+mkdir -p "$DEST"
+TS=$(date +%Y%m%d-%H%M)
+mkdir -p "${DEST}/${TS}"
+# link-dest to last snapshot
+LAST=$(ls -1t "$DEST" | head -n1)
+if [ -n "$LAST" ]; then
+  rsync -a --delete --link-dest="$DEST/$LAST" "$SRC/" "$DEST/$TS/"
+else
+  rsync -a "$SRC/" "$DEST/$TS/"
+fi
+# keep last 14 snapshots
+cd "$DEST"
+ls -1t | tail -n +15 | xargs -r rm -rf
+```
+
+Add cron `/etc/cron.daily/rsync_snapshots` to run daily.
+
+**Verify**
+
+```bash
+ls -l /mnt/usb_persist/backups
+du -sh /mnt/usb_persist/backups/*
+```
+
+---
+
+# 6 — Udev + systemd path-activated service to run metadata script on USB (hotplug)
+
+Why: hook your metadata tool to run automatically when persistence USB mounts.
+
+**udev rule** `/etc/udev/rules.d/99-fyde-persist.rules`
+
+```text
+ENV{ID_FS_LABEL}=="FYDE_PERSIST", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}="fyde-persist-mounted@%k.service"
+```
+
+**systemd template** `/etc/systemd/system/fyde-persist-mounted@.service`
+
+```ini
+[Unit]
+Description=Run metadata sync when persistence %i is added
+After=dev-%i.device
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/on_persist_mounted.sh /dev/%i
+```
+
+**exec script** `/usr/local/bin/on_persist_mounted.sh`
+
+```bash
+#!/bin/bash
+PDEV="$1"
+MOUNTPOINT="/mnt/usb_persist"
+sleep 1
+sudo cryptsetup open "$PDEV" fyde_persist || true
+mount /dev/mapper/fyde_persist "$MOUNTPOINT" || mount "$PDEV" "$MOUNTPOINT"
+# run your metadata script
+/home/chronos/scripts/metadata_cleaner.py >> /home/chronos/logs/metadata_run.log 2>&1
+```
+
+Reload udev:
+
+```bash
+sudo udevadm control --reload-rules
+sudo systemctl daemon-reload
+```
+
+**Test**
+Unplug/replug USB and watch `journalctl -f` or check `/home/chronos/logs/metadata_run.log`.
+
+---
+
+# 7 — Git bare repo for dotfiles with auto-deploy hook (reproducible configs)
+
+Why: keep your config reproducible and pushable.
+
+**Create repo (on your USB or remote)**:
+
+```bash
+cd ~
+git init --bare $HOME/.cfg
+alias config='/usr/bin/git --git-dir=$HOME/.cfg/ --work-tree=$HOME'
+config config --local status.showUntrackedFiles no
+```
+
+**Deploy hook** in the bare repo to copy and run install script after push:
+`~/.cfg/hooks/post-receive`:
+
+```bash
+#!/bin/bash
+GIT_WORK_TREE=$HOME git checkout -f
+cd $HOME && [ -x ./deploy.sh ] && ./deploy.sh
+```
+
+Make executable:
+
+```bash
+chmod +x ~/.cfg/hooks/post-receive
+```
+
+**Usage**
+
+```bash
+config add .bashrc .tmux.conf deploy.sh
+config commit -m "initial"
+config remote add origin git@github:you/dotfiles.git
+config push -u origin master
+```
+
+---
+
+# 8 — Reproducible USB image + verified recovery snapshot
+
+Why: quick restore if USB dies; minimal downtime.
+
+**Create compressed image**
+
+```bash
+sudo dd if=/dev/sdb bs=4M status=progress | pv | gzip > ~/fydeos_usb_backup_$(date +%F).img.gz
+sha256sum ~/fydeos_usb_backup_*.img.gz > ~/fydeos_usb_backup.sha256
+```
+
+**Restore**
+
+```bash
+gzip -dc fydeos_usb_backup_2025-10-24.img.gz | sudo dd of=/dev/sdb bs=4M status=progress
+sync
+```
+
+**Verify**
+
+```bash
+sha256sum -c ~/fydeos_usb_backup.sha256
+```
+
+---
+
+# 9 — ADB over network + autorun bridge (useful to push Android apks & debug)
+
+Why: side-load apps and debug Android subsystem without a cable.
+
+**Enable on Android instance**
+
+* In Android settings: Developer options → Enable ADB (or via shell).
+* Get Android container IP: `adb shell ip -f inet addr show wlan0` or `ip route`
+
+**Host script to connect** `/usr/local/bin/adb_connect.sh`:
+
+```bash
+#!/bin/bash
+ANDROID_IP="$1"   # pass IP
+if [ -z "$ANDROID_IP" ]; then
+  echo "Usage: $0 <ip>"
+  exit 1
+fi
+adb connect "$ANDROID_IP:5555"
+```
+
+**Auto-run**: use udev + systemd above to run `adb_connect.sh` when Android subsystem comes up (or create a systemd timer).
+
+**Verify**
+
+```bash
+adb devices
+adb install -r myapp.apk
+```
+
+---
+
+# 10 — CI for building and testing a custom openFyde overlay (skeleton)
+
+Why: make your setup reproducible and quickly build a tailored image for your Chromebox later.
+
+**Start**
+
+```bash
+git clone https://github.com/openFyde/getting-started.git
+cd getting-started
+# create overlay dir
+mkdir -p overlays/mydevice/{scripts,board,packages}
+# populate overlay with minimal files (board_config.mk, device_tree blobs or override scripts)
+```
+
+**Local build (very high-level)**
+Follow openFyde build docs — basic commands:
+
+```bash
+# fetch repo + dependencies
+repo init -u https://github.com/openFyde/manifest.git -b release
+repo sync
+# add your overlay to src and build via their build scripts (follow upstream docs)
+```
+
+**Automate**: create GitHub Actions to run build on push and publish build artifacts.
+
+---
+
+## Final verification checklist (quick)
+
+Run these after you implemented the tasks you picked:
+
+```bash
+# LUKS open + mount
+sudo cryptsetup status fyde_persist
+mount | grep usb_persist
+
+# Overlay check
+mount | grep overlay
+
+# tmpfs check
+mount | grep tmpfs
+
+# zram check
+swapon --show
+
+# udev/systemd hotplug check
+journalctl -u fyde-persist-mounted@* -n 200 --no-pager
+```
+
+---
+
+## Risks & caveats (don’t skip)
+
+* **Back up before you run anything that formats** — LUKS & dd destroy data.
+* **Live USB persistence and Chromium/FydeOS internals are unusual** — test one change at a time.
+* **Overlaying system folders can cause boot problems** — keep a rescue USB and recovery image.
+* **Some of these commands assume tools are present** (cryptsetup, rsync, smartctl, adb). If not, install them in the Linux container or remap accordingly.
+
+---
+
+If you want I’ll:
+
+* generate the full `.sh` files for the tasks you pick and put them together into a single repo scaffold you can clone; **or**
+* give you a single "master" bootstrap script that asks which components to enable and applies safe defaults.
+
+Which option — single master bootstrap or individual scripts repo?
